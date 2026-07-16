@@ -32,6 +32,17 @@ func (c *OpenAIClient) GenerateStream(
 		return nil, err
 	}
 
+	// File inputs and hosted code execution only exist on the Responses API;
+	// route those streams through the Responses transport (no function tools).
+	if requiresResponsesAPI(c.Model, params, 0) {
+		c.logger.Debug(ctx, "Routing streaming call to Responses API", map[string]interface{}{
+			"model":          c.Model,
+			"file_inputs":    len(params.FileInputs),
+			"code_execution": params.EnableCodeExecution,
+		})
+		return c.generateWithToolsResponsesStream(ctx, prompt, nil, params), nil
+	}
+
 	// Check for organization ID in context
 	defaultOrgID := "default"
 	if id, err := multitenancy.GetOrgID(ctx); err == nil {
@@ -277,12 +288,15 @@ func (c *OpenAIClient) GenerateWithToolsStream(
 		return nil, err
 	}
 
-	// Route reasoning + tools through /v1/responses: Chat Completions 400s when
+	// Route through /v1/responses when required: file inputs and hosted code
+	// execution only exist there, and Chat Completions 400s when
 	// reasoning_effort and tools are sent together for gpt-5 reasoning models.
-	if shouldUseResponsesAPI(c.Model, params.LLMConfig.Reasoning, len(tools)) {
-		c.logger.Debug(ctx, "Routing streaming tools call to Responses API for reasoning model", map[string]interface{}{
+	if requiresResponsesAPI(c.Model, params, len(tools)) {
+		c.logger.Debug(ctx, "Routing streaming tools call to Responses API", map[string]interface{}{
 			"model":            c.Model,
 			"reasoning_effort": params.LLMConfig.Reasoning,
+			"file_inputs":      len(params.FileInputs),
+			"code_execution":   params.EnableCodeExecution,
 		})
 		return c.generateWithToolsResponsesStream(ctx, prompt, tools, params), nil
 	}

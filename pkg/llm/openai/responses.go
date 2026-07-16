@@ -56,6 +56,16 @@ func validateResponsesAPIOptions(params *interfaces.GenerateOptions) error {
 		}
 	}
 
+	return validateFileInputs(params)
+}
+
+// validateFileInputs checks that each file input is well-formed for the chosen
+// mode. Shared by the streaming and non-streaming Responses API paths.
+func validateFileInputs(params *interfaces.GenerateOptions) error {
+	if params == nil {
+		return nil
+	}
+
 	for i, file := range params.FileInputs {
 		sources := 0
 		if file.FileID != "" {
@@ -87,11 +97,14 @@ func validateResponsesAPIOptions(params *interfaces.GenerateOptions) error {
 }
 
 func validateOpenAIStreamingOptions(params *interfaces.GenerateOptions, useResponsesAPI bool) error {
+	if params != nil && (len(params.FileInputs) > 0 || params.EnableCodeExecution) {
+		// File inputs and code execution stream through the Responses API
+		// transport (see requiresResponsesAPI); only well-formedness
+		// checks apply here so malformed inputs fail before any network call.
+		return validateFileInputs(params)
+	}
 	if useResponsesAPI {
 		return fmt.Errorf("openai responses api streaming is not supported in this SDK path yet; use Generate or disable WithResponsesAPI")
-	}
-	if params != nil && len(params.FileInputs) > 0 {
-		return fmt.Errorf("openai file inputs are not supported with streaming; use Generate or GenerateWithTools")
 	}
 	return nil
 }
@@ -185,17 +198,7 @@ func (c *OpenAIClient) newResponseRequest(prompt string, params *interfaces.Gene
 		Store: param.NewOpt(false),
 	}
 
-	if params.LLMConfig != nil {
-		if !isReasoningModel(c.Model) {
-			req.Temperature = param.NewOpt(params.LLMConfig.Temperature)
-			if params.LLMConfig.TopP > 0 && params.LLMConfig.TopP <= 1 {
-				req.TopP = param.NewOpt(params.LLMConfig.TopP)
-			}
-		}
-		if params.LLMConfig.Reasoning != "" {
-			req.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffort(params.LLMConfig.Reasoning)}
-		}
-	}
+	applyResponseTuning(&req, c.Model, params.LLMConfig)
 
 	if params.ResponseFormat != nil {
 		req.Text.Format = responses.ResponseFormatTextConfigUnionParam{OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
@@ -206,6 +209,24 @@ func (c *OpenAIClient) newResponseRequest(prompt string, params *interfaces.Gene
 	}
 
 	return req
+}
+
+// applyResponseTuning sets sampling and reasoning parameters on a Responses
+// request. Reasoning models only accept default sampling, and non-reasoning
+// models reject the reasoning param, so each is applied only where valid.
+func applyResponseTuning(req *responses.ResponseNewParams, model string, cfg *interfaces.LLMConfig) {
+	if cfg == nil {
+		return
+	}
+	if !isReasoningModel(model) {
+		req.Temperature = param.NewOpt(cfg.Temperature)
+		if cfg.TopP > 0 && cfg.TopP <= 1 {
+			req.TopP = param.NewOpt(cfg.TopP)
+		}
+	}
+	if cfg.Reasoning != "" {
+		req.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffort(cfg.Reasoning)}
+	}
 }
 
 func responseMessage(role, content string) *responses.EasyInputMessageParam {
@@ -400,11 +421,20 @@ func addResponseUsage(ctx context.Context, resp *responses.Response, model strin
 	}
 }
 
-// shouldUseResponsesAPI reports whether a tools call must route through the
-// /v1/responses endpoint instead of /v1/chat/completions. Chat Completions
-// 400s when reasoning_effort and tools are sent together for gpt-5 reasoning
-// models; the Responses API supports reasoning + tools in one request.
-func shouldUseResponsesAPI(model string, reasoning string, toolCount int) bool {
+// requiresResponsesAPI reports whether a call must route through the
+// /v1/responses endpoint instead of /v1/chat/completions. File inputs and the
+// hosted code interpreter only exist on the Responses API, and Chat
+// Completions 400s when reasoning_effort and tools are sent together for
+// gpt-5 reasoning models; the Responses API supports all of these in one
+// request, streamed or not.
+func requiresResponsesAPI(model string, params *interfaces.GenerateOptions, toolCount int) bool {
+	if params != nil && (len(params.FileInputs) > 0 || params.EnableCodeExecution) {
+		return true
+	}
+	reasoning := ""
+	if params != nil && params.LLMConfig != nil {
+		reasoning = params.LLMConfig.Reasoning
+	}
 	return isReasoningModel(model) && reasoning != "" && toolCount > 0
 }
 
@@ -427,8 +457,9 @@ func (c *OpenAIClient) generateWithToolsResponses(ctx context.Context, prompt st
 	// Convert tools to Responses function-tool params
 	responseTools := c.responseToolParams(tools)
 
-	// Build initial input items from memory, or the bare prompt when no memory
-	inputItems := c.buildResponseInput(ctx, prompt, params.Memory)
+	// Build initial input items from memory, or the bare prompt when no memory.
+	// No file inputs here: non-streaming file calls route to generateWithResponsesAPI.
+	inputItems := c.buildResponseInput(ctx, prompt, params.Memory, nil)
 
 	// Base request shared across loop iterations
 	baseReq := responses.ResponseNewParams{
@@ -561,11 +592,14 @@ func (c *OpenAIClient) generateWithToolsResponses(ctx context.Context, prompt st
 // buildResponseInput converts memory and the current prompt into Responses
 // input items. Tool-call round-trips from prior memory are omitted to avoid
 // dangling call_id references; plain user/assistant/system text is preserved.
-func (c *OpenAIClient) buildResponseInput(ctx context.Context, prompt string, memory interfaces.Memory) responses.ResponseInputParam {
+// File inputs are attached as input_file content on the user turn: the bare
+// prompt when there is no memory, otherwise the last user message (the current
+// prompt arrives via memory on that path).
+func (c *OpenAIClient) buildResponseInput(ctx context.Context, prompt string, memory interfaces.Memory, files []interfaces.FileInput) responses.ResponseInputParam {
 	items := responses.ResponseInputParam{}
 
 	if memory == nil {
-		items = append(items, responses.ResponseInputItemParamOfMessage(prompt, responses.EasyInputMessageRoleUser))
+		items = append(items, responses.ResponseInputItemUnionParam{OfMessage: responseUserMessage(prompt, files)})
 		return items
 	}
 
@@ -575,16 +609,28 @@ func (c *OpenAIClient) buildResponseInput(ctx context.Context, prompt string, me
 		return items
 	}
 
+	lastUserIdx := -1
 	for _, msg := range memoryMessages {
 		switch msg.Role {
 		case interfaces.MessageRoleUser:
 			items = append(items, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleUser))
+			lastUserIdx = len(items) - 1
 		case interfaces.MessageRoleAssistant:
 			if msg.Content != "" {
 				items = append(items, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleAssistant))
 			}
 		case interfaces.MessageRoleSystem:
 			items = append(items, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleSystem))
+		}
+	}
+
+	if len(files) > 0 {
+		if lastUserIdx >= 0 {
+			content := items[lastUserIdx].OfMessage.Content.OfString.Value
+			items[lastUserIdx] = responses.ResponseInputItemUnionParam{OfMessage: responseUserMessage(content, files)}
+		} else {
+			c.logger.Warn(ctx, "No user message in memory to attach file inputs to; appending prompt with files", nil)
+			items = append(items, responses.ResponseInputItemUnionParam{OfMessage: responseUserMessage(prompt, files)})
 		}
 	}
 	return items
@@ -752,13 +798,24 @@ func (c *OpenAIClient) generateWithToolsResponsesStream(ctx context.Context, pro
 		ctx := context.WithValue(ctx, organizationKey, orgID)
 
 		responseTools := c.responseToolParams(tools)
-		inputItems := c.buildResponseInput(ctx, prompt, params.Memory)
+
+		// With code execution enabled, files are mounted into the code
+		// interpreter container (see buildCodeExecutionTool) and the user turn
+		// stays text-only; otherwise they attach as readable input_file content.
+		fileParts := params.FileInputs
+		if params.EnableCodeExecution {
+			fileParts = nil
+		}
+		inputItems := c.buildResponseInput(ctx, prompt, params.Memory, fileParts)
 
 		baseReq := responses.ResponseNewParams{
-			Model:     shared.ResponsesModel(c.Model),
-			Tools:     responseTools,
-			Reasoning: shared.ReasoningParam{Effort: shared.ReasoningEffort(params.LLMConfig.Reasoning)},
-			Store:     openai.Bool(true),
+			Model: shared.ResponsesModel(c.Model),
+			Tools: responseTools,
+			Store: openai.Bool(true),
+		}
+		applyResponseTuning(&baseReq, c.Model, params.LLMConfig)
+		if params.EnableCodeExecution {
+			baseReq.Tools = append(baseReq.Tools, buildCodeExecutionTool(codeExecFileIDs(params)))
 		}
 		if params.SystemMessage != "" {
 			baseReq.Instructions = openai.String(params.SystemMessage)
@@ -924,7 +981,6 @@ func (c *OpenAIClient) generateWithToolsResponsesStream(ctx context.Context, pro
 		c.logger.Info(ctx, "Maximum iterations reached, making final streaming call without tools", map[string]interface{}{"maxIterations": maxIterations})
 		finalReq := responses.ResponseNewParams{
 			Model:              shared.ResponsesModel(c.Model),
-			Reasoning:          shared.ReasoningParam{Effort: shared.ReasoningEffort(params.LLMConfig.Reasoning)},
 			Store:              openai.Bool(true),
 			PreviousResponseID: openai.String(previousResponseID),
 			Input: responses.ResponseNewParamsInputUnion{OfInputItemList: responses.ResponseInputParam{
@@ -934,6 +990,7 @@ func (c *OpenAIClient) generateWithToolsResponsesStream(ctx context.Context, pro
 				),
 			}},
 		}
+		applyResponseTuning(&finalReq, c.Model, params.LLMConfig)
 		if params.SystemMessage != "" {
 			finalReq.Instructions = openai.String(params.SystemMessage)
 		}

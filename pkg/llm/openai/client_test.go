@@ -922,13 +922,17 @@ func TestStreamingValidationErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("file inputs are not silently ignored in streaming", func(t *testing.T) {
+	t.Run("malformed file inputs fail fast in streaming", func(t *testing.T) {
 		client := openai_client.NewClient("test-key")
-		_, err := client.GenerateStream(context.Background(), "test", openai_client.WithFileID("file_123"))
-		if err == nil || !strings.Contains(err.Error(), "file inputs are not supported with streaming") {
-			t.Fatalf("expected file input streaming error, got %v", err)
+		_, err := client.GenerateStream(context.Background(), "test",
+			openai_client.WithFileURL("https://example.com/data.csv"),
+			openai_client.WithCodeExecution(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "must be an uploaded FileID") {
+			t.Fatalf("expected uploaded-FileID error, got %v", err)
 		}
 	})
+
 }
 
 // mockMemory is a simple in-memory implementation for testing

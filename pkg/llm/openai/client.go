@@ -451,7 +451,7 @@ func (c *OpenAIClient) GenerateWithTools(ctx context.Context, prompt string, too
 
 	// Route reasoning + tools through /v1/responses: Chat Completions 400s when
 	// reasoning_effort and tools are sent together for gpt-5 reasoning models.
-	if shouldUseResponsesAPI(c.Model, params.LLMConfig.Reasoning, len(tools)) {
+	if requiresResponsesAPI(c.Model, params, len(tools)) {
 		c.logger.Debug(ctx, "Routing tools call to Responses API for reasoning model", map[string]interface{}{
 			"model":            c.Model,
 			"reasoning_effort": params.LLMConfig.Reasoning,
